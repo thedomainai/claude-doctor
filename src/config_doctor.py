@@ -431,6 +431,15 @@ def collect_config_files(claude_home: Optional[Path] = None) -> Dict[str, List[F
 # Context Detection
 # =============================================================================
 
+def classify_maturity(total_tokens: int) -> str:
+    """Classify config maturity based on total token count."""
+    if total_tokens < 500:
+        return "sparse"
+    elif total_tokens < 3000:
+        return "moderate"
+    else:
+        return "rich"
+
 def detect_context(
     files: Dict[str, List[FileMetrics]],
     claude_home: Optional[Path] = None,
@@ -450,12 +459,7 @@ def detect_context(
         for f in file_list:
             total_tokens += f.estimated_tokens
 
-    if total_tokens < 500:
-        config_maturity = "sparse"
-    elif total_tokens < 3000:
-        config_maturity = "moderate"
-    else:
-        config_maturity = "rich"
+    config_maturity = classify_maturity(total_tokens)
 
     setup_type = "multi_project" if project_count >= 2 else "single_project"
 

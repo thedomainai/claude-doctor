@@ -770,35 +770,17 @@ class TestEffectivenessProxyCheckExpanded(TestCase):
 # =============================================================================
 
 class TestMaturityBoundaries(TestCase):
-    def _detect_maturity(self, total_tokens):
-        files = {"global_claude_md": [_make_file(tokens=total_tokens)]}
-        ctx = cd.UserContext(
-            project_count=1, total_config_tokens=total_tokens,
-            config_maturity="", setup_type="single_project",
-            has_custom_skills=False, has_custom_rules=False,
-            has_project_memory=False, memory_line_count=0,
-            rule_count=0, skill_count=0, project_dirs=[],
-        )
-        # detect_context calculates maturity from total_tokens
-        # We test the classification logic directly
-        if total_tokens < 500:
-            return "sparse"
-        elif total_tokens < 3000:
-            return "moderate"
-        else:
-            return "rich"
-
     def test_499_is_sparse(self):
-        self.assertEqual(self._detect_maturity(499), "sparse")
+        self.assertEqual(cd.classify_maturity(499), "sparse")
 
     def test_500_is_moderate(self):
-        self.assertEqual(self._detect_maturity(500), "moderate")
+        self.assertEqual(cd.classify_maturity(500), "moderate")
 
     def test_2999_is_moderate(self):
-        self.assertEqual(self._detect_maturity(2999), "moderate")
+        self.assertEqual(cd.classify_maturity(2999), "moderate")
 
     def test_3000_is_rich(self):
-        self.assertEqual(self._detect_maturity(3000), "rich")
+        self.assertEqual(cd.classify_maturity(3000), "rich")
 
 
 class TestMaturityBoundariesIntegration(TestCase):
