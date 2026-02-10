@@ -1,4 +1,4 @@
-# claude-config-doctor
+# claude-doctor
 
 A diagnostic tool that analyzes the health of your [Claude Code](https://docs.anthropic.com/en/docs/claude-code) configuration as a whole system.
 
@@ -8,8 +8,8 @@ Claude Code uses a layered config hierarchy (`CLAUDE.md`, `rules/`, `skills/`, `
 
 ```bash
 # No installation needed — just clone and run
-git clone https://github.com/<your-username>/claude-config-doctor.git
-cd claude-config-doctor
+git clone https://github.com/thedomainai/claude-doctor.git
+cd claude-doctor
 
 python3 src/config_doctor.py
 ```
@@ -134,7 +134,7 @@ argument-hint: "[--quick]"
 Run the static analysis CLI:
 
 \`\`\`bash
-python3 /path/to/claude-config-doctor/src/config_doctor.py --json
+python3 /path/to/claude-doctor/src/config_doctor.py --json
 \`\`\`
 
 If `--quick` is passed, report the JSON results directly.
@@ -144,7 +144,7 @@ Otherwise, use the JSON output as a basis for deeper semantic analysis
 
 Then invoke it with `/config-doctor` or `/config-doctor --quick` in any Claude Code session.
 
-> **Note:** Update `/path/to/claude-config-doctor/` to the actual path where you cloned this repository.
+> **Note:** Update `/path/to/claude-doctor/` to the actual path where you cloned this repository.
 
 ## JSON Output Schema
 

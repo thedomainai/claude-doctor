@@ -1,4 +1,4 @@
-# claude-config-doctor
+# claude-doctor
 
 A diagnostic tool for Claude Code configuration files (CLAUDE.md, rules, skills, memory).
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-config-doctor: Diagnose the health of your Claude Code configuration.
+"""claude-doctor: Diagnose the health of your Claude Code configuration.
 
 Analyzes the entire config hierarchy (CLAUDE.md, rules, skills, memory, settings)
 as a system to detect redundancy, scope misplacement, budget overruns,
@@ -1197,8 +1197,8 @@ def format_report(
     out.append("")
     out.append(s.DIM + "  " + BOX_TL + BOX_H * w + BOX_TR + s.RESET)
     out.append(s.DIM + "  " + BOX_V + s.RESET
-               + s.BOLD + "  Claude Config Doctor"
-               + " " * (w - 22) + s.RESET
+               + s.BOLD + "  Claude Doctor"
+               + " " * (w - 14) + s.RESET
                + s.DIM + BOX_V + s.RESET)
     out.append(s.DIM + "  " + BOX_BL + BOX_H * w + BOX_BR + s.RESET)
     out.append("")
@@ -1406,7 +1406,7 @@ def format_json(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="config-doctor",
+        prog="claude-doctor",
         description="Diagnose the health of your Claude Code configuration",
     )
     parser.add_argument(
