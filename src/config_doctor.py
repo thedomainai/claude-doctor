@@ -166,6 +166,13 @@ def extract_sections(content: str) -> List[str]:
     ]
 
 
+_CJK_RE = re.compile(r'[\u3000-\u9fff\uff00-\uffef]')
+_PLACEHOLDER_RE = re.compile(r'YYYY|UUID|xxxx', re.IGNORECASE)
+_PATH_PREFIX_RE = re.compile(
+    r'^/(Users|home|var|etc|opt|tmp|usr|Library|root|srv|mnt)/'
+)
+
+
 def _looks_like_filesystem_path(p: str) -> bool:
     """Determine if a string is a real filesystem path.
 
@@ -178,10 +185,10 @@ def _looks_like_filesystem_path(p: str) -> bool:
     if p.startswith('///') or p.startswith('//'):
         return False
     # CJK characters (slash-separated text, e.g. 高/中/低)
-    if re.search(r'[\u3000-\u9fff\uff00-\uffef]', p):
+    if _CJK_RE.search(p):
         return False
     # Placeholder patterns
-    if re.search(r'YYYY|UUID|xxxx', p, re.IGNORECASE):
+    if _PLACEHOLDER_RE.search(p):
         return False
     if len(p) < 5:
         return False
@@ -189,7 +196,7 @@ def _looks_like_filesystem_path(p: str) -> bool:
     if p.startswith('~'):
         return True
     # Common absolute path prefixes (macOS + Linux)
-    if re.match(r'^/(Users|home|var|etc|opt|tmp|usr|Library|root|srv|mnt)/', p):
+    if _PATH_PREFIX_RE.match(p):
         return True
     return False
 
@@ -229,18 +236,41 @@ def count_directives(content: str) -> int:
     return count
 
 
-def count_negations(content: str) -> int:
-    """Count negative directive lines (English and Japanese)."""
-    patterns = [
+_RULE_INDICATORS = [
+    re.compile(r'\b(must|always|should|shall)\b', re.IGNORECASE),
+    re.compile(r'(してください|すること|必ず|常に)'),
+]
+
+_VAGUE_PATTERNS = [
+    (re.compile(r'適切に'), "\"appropriately\""),
+    (re.compile(r'必要に応じて'), "\"as needed\""),
+    (re.compile(r'適宜'), "\"as appropriate\""),
+    (re.compile(r'なるべく'), "\"preferably\""),
+    (re.compile(r'できれば'), "\"if possible\""),
+    (re.compile(r'\bif (?:necessary|needed|appropriate)\b', re.IGNORECASE),
+     "\"if necessary\""),
+    (re.compile(r'\bas (?:needed|appropriate)\b', re.IGNORECASE),
+     "\"as needed\""),
+    (re.compile(r'\bwhen (?:possible|appropriate)\b', re.IGNORECASE),
+     "\"when possible\""),
+]
+
+_NEGATION_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
         r'しない', r'使わない', r'避ける', r'禁止',
         r'不要', r'使用しない', r'行わない', r'含めない',
         r"\bdon'?t\b", r'\bnever\b', r'\bavoid\b',
         r'\bdo not\b', r'\bnot use\b', r'\bprohibit',
     ]
+]
+
+
+def count_negations(content: str) -> int:
+    """Count negative directive lines (English and Japanese)."""
     count = 0
     for line in content.splitlines():
-        for pattern in patterns:
-            if re.search(pattern, line, re.IGNORECASE):
+        for pattern in _NEGATION_PATTERNS:
+            if pattern.search(line):
                 count += 1
                 break
     return count
@@ -352,14 +382,14 @@ def collect_config_files(claude_home: Optional[Path] = None) -> Dict[str, List[F
     if claude_home is None:
         claude_home = Path.home() / ".claude"
 
-    files = {
+    files: Dict[str, List[FileMetrics]] = {
         "global_claude_md": [],
         "rules": [],
         "skills": [],
         "memories": [],
         "project_claude_mds": [],
         "settings": [],
-    }  # type: Dict[str, List[FileMetrics]]
+    }
 
     # Global CLAUDE.md
     files["global_claude_md"].append(
@@ -385,7 +415,7 @@ def collect_config_files(claude_home: Optional[Path] = None) -> Dict[str, List[F
             files["memories"].append(analyze_file(mem, "memory"))
 
     # Project CLAUDE.md files
-    seen = set()  # type: set
+    seen: set = set()
 
     def _add_project_md(md_path: Path) -> None:
         try:
@@ -433,12 +463,27 @@ def collect_config_files(claude_home: Optional[Path] = None) -> Dict[str, List[F
 
 def classify_maturity(total_tokens: int) -> str:
     """Classify config maturity based on total token count."""
-    if total_tokens < 500:
+    if total_tokens < MATURITY_SPARSE_LIMIT:
         return "sparse"
-    elif total_tokens < 3000:
+    elif total_tokens < MATURITY_MODERATE_LIMIT:
         return "moderate"
     else:
         return "rich"
+
+
+CONTENT_CATEGORIES = [
+    "global_claude_md", "rules", "skills", "memories", "project_claude_mds",
+]
+
+
+def iter_content_files(
+    files: Dict[str, List[FileMetrics]],
+    categories: Optional[List[str]] = None,
+) -> List[FileMetrics]:
+    """Collect FileMetrics from specified categories (default: all content categories)."""
+    if categories is None:
+        categories = CONTENT_CATEGORIES
+    return [fm for cat in categories for fm in files.get(cat, [])]
 
 def detect_context(
     files: Dict[str, List[FileMetrics]],
@@ -486,8 +531,24 @@ def detect_context(
 # Check Interface
 # =============================================================================
 
-CONTEXT_WINDOW_TOKENS = 200_000
+DEFAULT_CONTEXT_WINDOW = 200_000
 MEMORY_LINE_LIMIT = 200
+
+# --- Threshold Constants ---
+BUDGET_ERROR_RATIO = 0.05
+BUDGET_WARNING_RATIO = 0.01
+BUDGET_FILE_TOKEN_LIMIT = 1000
+MEMORY_WARNING_LINES = 180
+MEMORY_INFO_LINES = 150
+FRESHNESS_WARNING_DAYS = 180
+FRESHNESS_INFO_DAYS = 90
+NEGATION_WARNING_COUNT = 5
+NEGATION_INFO_COUNT = 3
+MATURITY_SPARSE_LIMIT = 500
+MATURITY_MODERATE_LIMIT = 3000
+PENALTY_ERROR = 0.3
+PENALTY_WARNING = 0.15
+PENALTY_INFO = 0.05
 
 
 class Check(ABC):
@@ -523,11 +584,11 @@ class Check(ABC):
         penalty = 0.0
         for f in findings:
             if f.severity == "error":
-                penalty += 0.3
+                penalty += PENALTY_ERROR
             elif f.severity == "warning":
-                penalty += 0.15
+                penalty += PENALTY_WARNING
             elif f.severity == "info":
-                penalty += 0.05
+                penalty += PENALTY_INFO
         score = max(0.0, 1.0 - penalty)
         return CheckResult(self.name(), self.display_name(), findings, score, True)
 
@@ -554,38 +615,37 @@ class BudgetCheck(Check):
         total = ctx.total_config_tokens
         ratio = total / context_window
 
-        if ratio > 0.05:
+        if ratio > BUDGET_ERROR_RATIO:
             findings.append(Finding(
                 severity="error", dimension="budget",
-                message="Config tokens exceed 5%% of context window "
-                        "(%d tokens, %.1f%%)" % (total, ratio * 100),
+                message="Config tokens exceed %.0f%% of context window "
+                        "(%d tokens, %.1f%%)"
+                        % (BUDGET_ERROR_RATIO * 100, total, ratio * 100),
                 file_path="(total)",
                 suggestion="Reduce config size by removing unnecessary content",
             ))
-        elif ratio > 0.01:
+        elif ratio > BUDGET_WARNING_RATIO:
             findings.append(Finding(
                 severity="warning", dimension="budget",
-                message="Config tokens exceed 1%% of context window "
-                        "(%d tokens, %.1f%%)" % (total, ratio * 100),
+                message="Config tokens exceed %.0f%% of context window "
+                        "(%d tokens, %.1f%%)"
+                        % (BUDGET_WARNING_RATIO * 100, total, ratio * 100),
                 file_path="(total)",
                 suggestion="Config is growing. Consider simplifying",
             ))
 
-        for category, file_list in files.items():
-            if category == "settings":
-                continue
-            for f in file_list:
-                if f.estimated_tokens > 1000:
-                    findings.append(Finding(
-                        severity="info", dimension="budget",
-                        message="Single file exceeds 1000 tokens (%d tokens)"
-                                % f.estimated_tokens,
-                        file_path=f.path,
-                        suggestion="Consider splitting or simplifying this file",
-                    ))
+        for f in iter_content_files(files):
+            if f.estimated_tokens > BUDGET_FILE_TOKEN_LIMIT:
+                findings.append(Finding(
+                    severity="info", dimension="budget",
+                    message="Single file exceeds %d tokens (%d tokens)"
+                            % (BUDGET_FILE_TOKEN_LIMIT, f.estimated_tokens),
+                    file_path=f.path,
+                    suggestion="Consider splitting or simplifying this file",
+                ))
 
         for mem in files.get("memories", []):
-            if mem.line_count > 180:
+            if mem.line_count > MEMORY_WARNING_LINES:
                 findings.append(Finding(
                     severity="warning", dimension="budget",
                     message="MEMORY.md approaching limit (%d/%d lines)"
@@ -593,7 +653,7 @@ class BudgetCheck(Check):
                     file_path=mem.path,
                     suggestion="Clean up outdated information",
                 ))
-            elif mem.line_count > 150:
+            elif mem.line_count > MEMORY_INFO_LINES:
                 findings.append(Finding(
                     severity="info", dimension="budget",
                     message="MEMORY.md at %d/%d lines"
@@ -620,13 +680,11 @@ class RedundancyCheck(Check):
             context_window: int) -> CheckResult:
         findings = []
 
-        directives_by_norm = {}  # type: Dict[str, List[Tuple[str, str, int]]]
+        directives_by_norm: Dict[str, List[Tuple[str, str, int]]] = {}
 
-        all_files = []
-        for category in ["global_claude_md", "rules", "memories", "project_claude_mds"]:
-            all_files.extend(files.get(category, []))
-
-        for fm in all_files:
+        for fm in iter_content_files(
+            files, ["global_claude_md", "rules", "memories", "project_claude_mds"]
+        ):
             if not fm.exists:
                 continue
             for i, line in enumerate(fm.content.splitlines(), 1):
@@ -681,13 +739,19 @@ class ScopeFitnessCheck(Check):
             if len(name) > 3:
                 project_names.add(name)
 
+        # Build word-boundary patterns for project names
+        project_pats = {
+            pname: re.compile(r'\b' + re.escape(pname) + r'\b')
+            for pname in project_names
+        }
+
         # Check global CLAUDE.md for project-specific keywords
         for fm in files.get("global_claude_md", []):
             if not fm.exists:
                 continue
             for i, line in enumerate(fm.content.splitlines(), 1):
-                for pname in project_names:
-                    if pname in line:
+                for pname, pat in project_pats.items():
+                    if pat.search(line):
                         findings.append(Finding(
                             severity="warning", dimension="scope_fitness",
                             message="Global CLAUDE.md contains project-specific "
@@ -702,8 +766,8 @@ class ScopeFitnessCheck(Check):
             if not fm.exists:
                 continue
             for i, line in enumerate(fm.content.splitlines(), 1):
-                for pname in project_names:
-                    if pname in line:
+                for pname, pat in project_pats.items():
+                    if pat.search(line):
                         findings.append(Finding(
                             severity="info", dimension="scope_fitness",
                             message="Global rule references project: \"%s\""
@@ -712,10 +776,6 @@ class ScopeFitnessCheck(Check):
                         ))
 
         # Check MEMORY.md for rule-like directives that belong elsewhere
-        rule_indicators = [
-            r'\b(must|always|should|shall)\b',
-            r'(してください|すること|必ず|常に)',
-        ]
         for fm in files.get("memories", []):
             if not fm.exists:
                 continue
@@ -725,8 +785,8 @@ class ScopeFitnessCheck(Check):
                     continue
                 if stripped.startswith(("#", "`")):
                     continue
-                for pattern in rule_indicators:
-                    if re.search(pattern, stripped, re.IGNORECASE):
+                for pattern in _RULE_INDICATORS:
+                    if pattern.search(stripped):
                         findings.append(Finding(
                             severity="info", dimension="scope_fitness",
                             message="MEMORY.md contains rule-like directive: "
@@ -757,11 +817,7 @@ class FreshnessCheck(Check):
         findings = []
         now = datetime.now(tz=timezone.utc)
 
-        all_files = []
-        for category in ["global_claude_md", "rules", "skills", "memories", "project_claude_mds"]:
-            all_files.extend(files.get(category, []))
-
-        for fm in all_files:
+        for fm in iter_content_files(files):
             if not fm.exists:
                 continue
 
@@ -782,14 +838,14 @@ class FreshnessCheck(Check):
             if fm.last_modified:
                 mtime = datetime.fromisoformat(fm.last_modified)
                 days_old = (now - mtime).days
-                if days_old > 180:
+                if days_old > FRESHNESS_WARNING_DAYS:
                     findings.append(Finding(
                         severity="warning", dimension="freshness",
                         message="Not updated in %d days" % days_old,
                         file_path=fm.path,
                         suggestion="Review whether content is still accurate",
                     ))
-                elif days_old > 90:
+                elif days_old > FRESHNESS_INFO_DAYS:
                     findings.append(Finding(
                         severity="info", dimension="freshness",
                         message="Not updated in %d days" % days_old,
@@ -851,12 +907,10 @@ class ConflictsCheck(Check):
             ],
         }
 
-        all_files = []
-        for category in ["global_claude_md", "rules", "memories", "project_claude_mds"]:
-            all_files.extend(files.get(category, []))
-
-        topic_values = {}  # type: Dict[str, List[Tuple[str, str, int]]]
-        for fm in all_files:
+        topic_values: Dict[str, List[Tuple[str, str, int]]] = {}
+        for fm in iter_content_files(
+            files, ["global_claude_md", "rules", "memories", "project_claude_mds"]
+        ):
             if not fm.exists:
                 continue
             for i, line in enumerate(fm.content.splitlines(), 1):
@@ -1006,15 +1060,16 @@ class EffectivenessProxyCheck(Check):
 
         total_negations = 0
         negation_locations = []
-        for category in ["global_claude_md", "rules", "memories", "project_claude_mds"]:
-            for fm in files.get(category, []):
-                if fm.negation_count > 0:
-                    total_negations += fm.negation_count
-                    negation_locations.append(
-                        "%s (%d)" % (fm.path, fm.negation_count)
-                    )
+        for fm in iter_content_files(
+            files, ["global_claude_md", "rules", "memories", "project_claude_mds"]
+        ):
+            if fm.negation_count > 0:
+                total_negations += fm.negation_count
+                negation_locations.append(
+                    "%s (%d)" % (fm.path, fm.negation_count)
+                )
 
-        if total_negations > 5:
+        if total_negations > NEGATION_WARNING_COUNT:
             findings.append(Finding(
                 severity="warning", dimension="effectiveness_proxy",
                 message="High number of negative directives (%d)"
@@ -1023,44 +1078,34 @@ class EffectivenessProxyCheck(Check):
                 suggestion="Rephrase negatives as positives for clarity. "
                            "Locations: %s" % ", ".join(negation_locations),
             ))
-        elif total_negations > 3:
+        elif total_negations > NEGATION_INFO_COUNT:
             findings.append(Finding(
                 severity="info", dimension="effectiveness_proxy",
                 message="%d negative directives found" % total_negations,
                 file_path="(total)",
             ))
 
-        vague_patterns = [
-            (r'適切に', "\"appropriately\""),
-            (r'必要に応じて', "\"as needed\""),
-            (r'適宜', "\"as appropriate\""),
-            (r'なるべく', "\"preferably\""),
-            (r'できれば', "\"if possible\""),
-            (r'\bif (?:necessary|needed|appropriate)\b', "\"if necessary\""),
-            (r'\bas (?:needed|appropriate)\b', "\"as needed\""),
-            (r'\bwhen (?:possible|appropriate)\b', "\"when possible\""),
-        ]
-
         vague_count = 0
-        for category in ["global_claude_md", "rules", "project_claude_mds"]:
-            for fm in files.get(category, []):
-                if not fm.exists:
-                    continue
-                for i, line in enumerate(fm.content.splitlines(), 1):
-                    for pattern, label in vague_patterns:
-                        if re.search(pattern, line, re.IGNORECASE):
-                            vague_count += 1
-                            if vague_count <= 3:
-                                findings.append(Finding(
-                                    severity="info",
-                                    dimension="effectiveness_proxy",
-                                    message="Vague expression %s: \"%s\""
-                                            % (label, line.strip()),
-                                    file_path=fm.path, line_number=i,
-                                    suggestion="Replace with specific criteria "
-                                               "for more reliable behavior",
-                                ))
-                            break
+        for fm in iter_content_files(
+            files, ["global_claude_md", "rules", "project_claude_mds"]
+        ):
+            if not fm.exists:
+                continue
+            for i, line in enumerate(fm.content.splitlines(), 1):
+                for pattern, label in _VAGUE_PATTERNS:
+                    if pattern.search(line):
+                        vague_count += 1
+                        if vague_count <= 3:
+                            findings.append(Finding(
+                                severity="info",
+                                dimension="effectiveness_proxy",
+                                message="Vague expression %s: \"%s\""
+                                        % (label, line.strip()),
+                                file_path=fm.path, line_number=i,
+                                suggestion="Replace with specific criteria "
+                                           "for more reliable behavior",
+                            ))
+                        break
 
         if vague_count > 3:
             findings.append(Finding(
@@ -1077,7 +1122,7 @@ class EffectivenessProxyCheck(Check):
 # Check Registry & Scoring
 # =============================================================================
 
-ALL_CHECKS = [
+ALL_CHECKS: List[Check] = [
     BudgetCheck(),
     RedundancyCheck(),
     ScopeFitnessCheck(),
@@ -1085,9 +1130,9 @@ ALL_CHECKS = [
     ConflictsCheck(),
     CoverageCheck(),
     EffectivenessProxyCheck(),
-]  # type: List[Check]
+]
 
-WEIGHTS = {
+WEIGHTS: Dict[str, float] = {
     "budget": 1.0,
     "redundancy": 0.5,
     "scope_fitness": 1.0,
@@ -1095,7 +1140,7 @@ WEIGHTS = {
     "conflicts": 1.5,
     "coverage": 1.0,
     "effectiveness_proxy": 0.5,
-}  # type: Dict[str, float]
+}
 
 
 def calculate_overall(results: List[CheckResult]) -> Tuple[float, str]:
@@ -1356,12 +1401,12 @@ def format_json(
     """Output all diagnostic data in JSON format."""
 
     def finding_to_dict(f: Finding) -> Dict[str, Any]:
-        d = {
+        d: Dict[str, Any] = {
             "severity": f.severity,
             "dimension": f.dimension,
             "message": f.message,
             "file_path": f.file_path,
-        }  # type: Dict[str, Any]
+        }
         if f.line_number is not None:
             d["line_number"] = f.line_number
         if f.suggestion is not None:
@@ -1460,9 +1505,6 @@ def run_diagnosis(
     str,
 ]:
     """Run the full diagnosis and return results (API for tests and integrations)."""
-    global CONTEXT_WINDOW_TOKENS
-    CONTEXT_WINDOW_TOKENS = context_window
-
     files = collect_config_files(claude_home)
     ctx = detect_context(files, claude_home)
 
