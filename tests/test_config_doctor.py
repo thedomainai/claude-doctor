@@ -220,6 +220,39 @@ class TestPathFromProjectDirName(TestCase):
 # Check Tests
 # =============================================================================
 
+class TestIterContentFiles(TestCase):
+    def test_default_categories(self):
+        files = {
+            "global_claude_md": [_make_file(path="/a.md")],
+            "rules": [_make_file(path="/b.md", category="rule")],
+            "skills": [_make_file(path="/c.md", category="skill")],
+            "memories": [_make_file(path="/d.md", category="memory")],
+            "project_claude_mds": [_make_file(path="/e.md", category="project_claude_md")],
+            "settings": [_make_file(path="/f.json", category="settings")],
+        }
+        result = cd.iter_content_files(files)
+        paths = [fm.path for fm in result]
+        self.assertEqual(len(result), 5)
+        self.assertNotIn("/f.json", paths)
+
+    def test_specific_categories(self):
+        files = {
+            "global_claude_md": [_make_file(path="/a.md")],
+            "rules": [_make_file(path="/b.md", category="rule")],
+            "memories": [_make_file(path="/c.md", category="memory")],
+        }
+        result = cd.iter_content_files(files, ["global_claude_md", "rules"])
+        paths = [fm.path for fm in result]
+        self.assertEqual(len(result), 2)
+        self.assertIn("/a.md", paths)
+        self.assertIn("/b.md", paths)
+
+    def test_missing_category(self):
+        files = {"global_claude_md": [_make_file(path="/a.md")]}
+        result = cd.iter_content_files(files, ["global_claude_md", "rules"])
+        self.assertEqual(len(result), 1)
+
+
 class TestBudgetCheck(TestCase):
     def test_healthy_budget(self):
         files = {"global_claude_md": [_make_file(tokens=500)]}
@@ -317,6 +350,58 @@ class TestScopeFitnessCheck(TestCase):
         )
         result = cd.ScopeFitnessCheck().run(files, ctx, CW)
         self.assertTrue(any("project-specific" in f.message for f in result.findings))
+
+    def test_word_boundary_avoids_false_positive(self):
+        """'app' should not match 'application' (word boundary check)."""
+        files = {
+            "global_claude_md": [_make_file(
+                content="- Use the application framework\n",
+            )],
+            "rules": [],
+            "memories": [],
+            "project_claude_mds": [],
+        }
+        ctx = _make_context(
+            project_dirs=["/Users/alice/projects/application"]
+        )
+        result = cd.ScopeFitnessCheck().run(files, ctx, CW)
+        # "application" exactly matches; this should detect it
+        self.assertTrue(any("project-specific" in f.message for f in result.findings))
+
+    def test_word_boundary_no_false_positive_substring(self):
+        """Short project name should not match as substring of a longer word."""
+        files = {
+            "global_claude_md": [_make_file(
+                content="- Configure webapp settings\n",
+            )],
+            "rules": [],
+            "memories": [],
+            "project_claude_mds": [],
+        }
+        ctx = _make_context(
+            project_dirs=["/Users/alice/projects/webapp"]
+        )
+        # "webapp" appears as exact word, so it should match
+        result = cd.ScopeFitnessCheck().run(files, ctx, CW)
+        self.assertTrue(any("project-specific" in f.message for f in result.findings))
+
+    def test_word_boundary_no_match_in_larger_word(self):
+        """Project name 'test' should not match 'testing'."""
+        files = {
+            "global_claude_md": [_make_file(
+                content="- Run testing suite\n",
+            )],
+            "rules": [],
+            "memories": [],
+            "project_claude_mds": [],
+        }
+        ctx = _make_context(
+            project_dirs=["/Users/alice/projects/test"]
+        )
+        result = cd.ScopeFitnessCheck().run(files, ctx, CW)
+        # "test" should not match "testing" due to word boundary
+        scope_findings = [f for f in result.findings if "project-specific" in f.message]
+        self.assertEqual(len(scope_findings), 0)
 
 
 class TestFreshnessCheck(TestCase):
