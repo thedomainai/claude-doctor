@@ -739,11 +739,15 @@ class ScopeFitnessCheck(Check):
             if len(name) > 3:
                 project_names.add(name)
 
-        # Build word-boundary patterns for project names
-        project_pats = {
-            pname: re.compile(r'\b' + re.escape(pname) + r'\b')
-            for pname in project_names
-        }
+        # Build patterns for project names
+        # Use word boundary for ASCII names; plain escape for CJK names
+        project_pats = {}
+        for pname in project_names:
+            escaped = re.escape(pname)
+            if _CJK_RE.search(pname):
+                project_pats[pname] = re.compile(escaped)
+            else:
+                project_pats[pname] = re.compile(r'\b' + escaped + r'\b')
 
         # Check global CLAUDE.md for project-specific keywords
         for fm in files.get("global_claude_md", []):
@@ -1484,8 +1488,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Disable colored output",
     )
     parser.add_argument(
-        "--context-window", type=int, default=200_000,
-        help="Context window size in tokens (default: 200000)",
+        "--context-window", type=int, default=DEFAULT_CONTEXT_WINDOW,
+        help="Context window size in tokens (default: %d)" % DEFAULT_CONTEXT_WINDOW,
     )
     parser.add_argument(
         "--claude-home", type=str, default=None,
@@ -1496,7 +1500,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def run_diagnosis(
     claude_home: Optional[Path] = None,
-    context_window: int = 200_000,
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
 ) -> Tuple[
     List[CheckResult],
     Dict[str, List[FileMetrics]],
