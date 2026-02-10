@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 from unittest import TestCase, main
@@ -499,8 +500,13 @@ class TestFormatJson(TestCase):
 
 
 class TestFormatReport(TestCase):
-    def test_contains_score(self):
+    def setUp(self):
         cd.Style.disable()
+
+    def tearDown(self):
+        cd.Style.reset()
+
+    def test_contains_score(self):
         files = {"global_claude_md": [_make_file(content="# Test\n")]}
         ctx = _make_context()
         results = [cd.CheckResult("budget", "Budget", [], 0.85, True)]
@@ -509,7 +515,6 @@ class TestFormatReport(TestCase):
         self.assertIn("B", output)
 
     def test_no_color_mode(self):
-        cd.Style.disable()
         files = {"global_claude_md": [_make_file(content="# Test\n")]}
         ctx = _make_context()
         results = [cd.CheckResult("budget", "Budget", [], 1.0, True)]
@@ -533,6 +538,10 @@ class TestShortenPath(TestCase):
 # =============================================================================
 
 class TestIntegration(TestCase):
+    def tearDown(self):
+        # main() with --json disables Style; restore it
+        cd.Style.reset()
+
     def test_minimal_setup(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             claude_home = Path(tmpdir) / ".claude"
@@ -622,6 +631,298 @@ class TestIntegration(TestCase):
             output = buf.getvalue()
             parsed = json.loads(output)
             self.assertIn("overall", parsed)
+
+
+# =============================================================================
+# Style Reset
+# =============================================================================
+
+class TestStyleReset(TestCase):
+    def test_disable_and_reset(self):
+        """Style.disable() then Style.reset() should restore original values."""
+        # Ensure clean state first (prior tests may have disabled Style)
+        cd.Style.reset()
+        original_red = cd.Style.RED
+        self.assertNotEqual(original_red, "")
+        cd.Style.disable()
+        self.assertEqual(cd.Style.RED, "")
+        self.assertFalse(cd.Style.is_enabled())
+        cd.Style.reset()
+        self.assertEqual(cd.Style.RED, original_red)
+        self.assertTrue(cd.Style.is_enabled())
+
+
+# =============================================================================
+# Discover Projects
+# =============================================================================
+
+class TestDiscoverProjects(TestCase):
+    def test_empty_when_no_projects_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claude_home = Path(tmpdir) / ".claude"
+            claude_home.mkdir()
+            result = cd.discover_projects(claude_home)
+            self.assertEqual(result, [])
+
+    def test_discovers_project_with_git(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proj_dir = Path(tmpdir) / "myproject"
+            proj_dir.mkdir()
+            (proj_dir / ".git").mkdir()
+            claude_home = Path(tmpdir) / ".claude"
+            projects_dir = claude_home / "projects"
+            dash_name = str(proj_dir).replace("/", "-")
+            (projects_dir / dash_name).mkdir(parents=True)
+            result = cd.discover_projects(claude_home)
+            self.assertIn(str(proj_dir), result)
+
+    def test_discovers_child_projects(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir) / "workspace"
+            parent.mkdir()
+            child = parent / "app"
+            child.mkdir()
+            (child / "package.json").write_text("{}")
+            claude_home = Path(tmpdir) / ".claude"
+            dash_name = str(parent).replace("/", "-")
+            (claude_home / "projects" / dash_name).mkdir(parents=True)
+            result = cd.discover_projects(claude_home)
+            self.assertIn(str(child), result)
+
+    def test_ignores_hidden_dirs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir) / "workspace"
+            parent.mkdir()
+            hidden = parent / ".hidden"
+            hidden.mkdir()
+            (hidden / ".git").mkdir()
+            claude_home = Path(tmpdir) / ".claude"
+            dash_name = str(parent).replace("/", "-")
+            (claude_home / "projects" / dash_name).mkdir(parents=True)
+            result = cd.discover_projects(claude_home)
+            self.assertNotIn(str(hidden), result)
+
+    def test_returns_sorted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parent = Path(tmpdir) / "workspace"
+            parent.mkdir()
+            for name in ["zzz", "aaa", "mmm"]:
+                d = parent / name
+                d.mkdir()
+                (d / ".git").mkdir()
+            claude_home = Path(tmpdir) / ".claude"
+            dash_name = str(parent).replace("/", "-")
+            (claude_home / "projects" / dash_name).mkdir(parents=True)
+            result = cd.discover_projects(claude_home)
+            self.assertEqual(result, sorted(result))
+
+
+# =============================================================================
+# EffectivenessProxyCheck (expanded)
+# =============================================================================
+
+class TestEffectivenessProxyCheckExpanded(TestCase):
+    def _run(self, content):
+        files = {
+            "global_claude_md": [_make_file(content=content)],
+            "rules": [], "memories": [], "project_claude_mds": [],
+        }
+        ctx = _make_context()
+        return cd.EffectivenessProxyCheck().run(files, ctx, CW)
+
+    def test_no_issues(self):
+        result = self._run("- Use formal tone\n- Write tests\n")
+        self.assertEqual(result.score, 1.0)
+        self.assertEqual(len(result.findings), 0)
+
+    def test_few_negations_info(self):
+        content = "- don't use\n- avoid this\n- never do\n- prohibit X\n"
+        result = self._run(content)
+        self.assertTrue(any(
+            "4 negative" in f.message for f in result.findings
+        ))
+
+    def test_vague_expressions_detected(self):
+        content = "- Handle errors appropriately\n- if necessary, add tests\n"
+        # Japanese vague patterns won't match English, use English ones
+        result = self._run(content)
+        self.assertTrue(any("Vague" in f.message for f in result.findings))
+
+    def test_vague_expressions_display_limit(self):
+        content = "\n".join([
+            "- do as needed",
+            "- when possible, optimize",
+            "- if necessary, refactor",
+            "- when appropriate, document",
+            "- if needed, test",
+        ])
+        result = self._run(content)
+        vague_findings = [f for f in result.findings if "Vague" in f.message or "vague" in f.message]
+        # At most 3 individual + 1 summary
+        individual = [f for f in vague_findings if "more vague" not in f.message]
+        summary = [f for f in vague_findings if "more vague" in f.message]
+        self.assertLessEqual(len(individual), 3)
+        self.assertEqual(len(summary), 1)
+
+
+# =============================================================================
+# Boundary Value Tests
+# =============================================================================
+
+class TestMaturityBoundaries(TestCase):
+    def test_499_is_sparse(self):
+        self.assertEqual(cd.classify_maturity(499), "sparse")
+
+    def test_500_is_moderate(self):
+        self.assertEqual(cd.classify_maturity(500), "moderate")
+
+    def test_2999_is_moderate(self):
+        self.assertEqual(cd.classify_maturity(2999), "moderate")
+
+    def test_3000_is_rich(self):
+        self.assertEqual(cd.classify_maturity(3000), "rich")
+
+
+class TestMaturityBoundariesIntegration(TestCase):
+    """Integration test: detect_context produces correct maturity."""
+
+    def _build_and_detect(self, content):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claude_home = Path(tmpdir) / ".claude"
+            claude_home.mkdir()
+            (claude_home / "CLAUDE.md").write_text(content)
+            files = cd.collect_config_files(claude_home)
+            ctx = cd.detect_context(files, claude_home)
+            return ctx
+
+    def test_sparse_setup(self):
+        ctx = self._build_and_detect("# Hi\n")
+        self.assertEqual(ctx.config_maturity, "sparse")
+
+    def test_rich_setup(self):
+        # Generate enough content to exceed 3000 tokens
+        content = "# Rules\n" + "\n".join(
+            ["- Rule number %d: do something specific" % i for i in range(500)]
+        )
+        ctx = self._build_and_detect(content)
+        self.assertEqual(ctx.config_maturity, "rich")
+
+
+class TestMemoryLineBoundaries(TestCase):
+    def _run_budget(self, line_count):
+        content = "\n".join(["line"] * line_count)
+        files = {
+            "global_claude_md": [_make_file(tokens=50)],
+            "memories": [_make_file(
+                path="/mock/memory.md", category="memory",
+                content=content, line_count=line_count,
+            )],
+        }
+        ctx = _make_context(total_config_tokens=50)
+        return cd.BudgetCheck().run(files, ctx, CW)
+
+    def test_150_lines_no_memory_finding(self):
+        result = self._run_budget(150)
+        memory_findings = [f for f in result.findings if "MEMORY.md" in f.message]
+        self.assertEqual(len(memory_findings), 0)
+
+    def test_151_lines_info(self):
+        result = self._run_budget(151)
+        memory_findings = [f for f in result.findings if "MEMORY.md" in f.message]
+        self.assertEqual(len(memory_findings), 1)
+        self.assertEqual(memory_findings[0].severity, "info")
+
+    def test_180_lines_info(self):
+        result = self._run_budget(180)
+        memory_findings = [f for f in result.findings if "MEMORY.md" in f.message]
+        self.assertEqual(len(memory_findings), 1)
+        self.assertEqual(memory_findings[0].severity, "info")
+
+    def test_181_lines_warning(self):
+        result = self._run_budget(181)
+        memory_findings = [f for f in result.findings if "MEMORY.md" in f.message]
+        self.assertEqual(len(memory_findings), 1)
+        self.assertEqual(memory_findings[0].severity, "warning")
+
+
+class TestFreshnessBoundaries(TestCase):
+    def _make_file_with_age(self, days):
+        from datetime import timedelta
+        mtime = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        return cd.FileMetrics(
+            path="/mock/test.md", category="global_claude_md", exists=True,
+            size_bytes=10, line_count=1, estimated_tokens=5,
+            last_modified=mtime.isoformat(),
+            sections=[], referenced_paths=[], directive_count=0,
+            negation_count=0, content="# Test\n",
+        )
+
+    def _run(self, days):
+        files = {
+            "global_claude_md": [self._make_file_with_age(days)],
+            "rules": [], "skills": [], "memories": [],
+            "project_claude_mds": [],
+        }
+        ctx = _make_context()
+        return cd.FreshnessCheck().run(files, ctx, CW)
+
+    def test_90_days_no_finding(self):
+        result = self._run(90)
+        age_findings = [f for f in result.findings if "days" in f.message]
+        self.assertEqual(len(age_findings), 0)
+
+    def test_91_days_info(self):
+        result = self._run(91)
+        age_findings = [f for f in result.findings if "days" in f.message]
+        self.assertEqual(len(age_findings), 1)
+        self.assertEqual(age_findings[0].severity, "info")
+
+    def test_180_days_info(self):
+        result = self._run(180)
+        age_findings = [f for f in result.findings if "days" in f.message]
+        self.assertEqual(len(age_findings), 1)
+        self.assertEqual(age_findings[0].severity, "info")
+
+    def test_181_days_warning(self):
+        result = self._run(181)
+        age_findings = [f for f in result.findings if "days" in f.message]
+        self.assertEqual(len(age_findings), 1)
+        self.assertEqual(age_findings[0].severity, "warning")
+
+
+class TestNegationBoundaries(TestCase):
+    def _run(self, negation_count):
+        lines = ["- don't do thing %d" % i for i in range(negation_count)]
+        content = "\n".join(lines)
+        files = {
+            "global_claude_md": [_make_file(content=content)],
+            "rules": [], "memories": [], "project_claude_mds": [],
+        }
+        ctx = _make_context()
+        return cd.EffectivenessProxyCheck().run(files, ctx, CW)
+
+    def test_3_negations_no_finding(self):
+        result = self._run(3)
+        neg_findings = [f for f in result.findings if "negative" in f.message.lower()]
+        self.assertEqual(len(neg_findings), 0)
+
+    def test_4_negations_info(self):
+        result = self._run(4)
+        neg_findings = [f for f in result.findings if "negative" in f.message.lower()]
+        self.assertEqual(len(neg_findings), 1)
+        self.assertEqual(neg_findings[0].severity, "info")
+
+    def test_5_negations_info(self):
+        result = self._run(5)
+        neg_findings = [f for f in result.findings if "negative" in f.message.lower()]
+        self.assertEqual(len(neg_findings), 1)
+        self.assertEqual(neg_findings[0].severity, "info")
+
+    def test_6_negations_warning(self):
+        result = self._run(6)
+        neg_findings = [f for f in result.findings if "negative" in f.message.lower()]
+        self.assertEqual(len(neg_findings), 1)
+        self.assertEqual(neg_findings[0].severity, "warning")
 
 
 if __name__ == "__main__":

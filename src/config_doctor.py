@@ -47,6 +47,8 @@ class Style:
     BG_YELLOW = "\033[43m"
     BG_BLUE = "\033[44m"
 
+    _defaults: dict = {}
+
     @classmethod
     def disable(cls) -> None:
         for attr in dir(cls):
@@ -55,8 +57,23 @@ class Style:
         cls._enabled = False
 
     @classmethod
+    def reset(cls) -> None:
+        """Restore all style attributes to their original values."""
+        for attr, value in cls._defaults.items():
+            setattr(cls, attr, value)
+        cls._enabled = True
+
+    @classmethod
     def is_enabled(cls) -> bool:
         return cls._enabled
+
+
+# Store default Style values for reset()
+Style._defaults = {
+    attr: getattr(Style, attr)
+    for attr in dir(Style)
+    if attr.isupper() and not attr.startswith("_")
+}
 
 
 # =============================================================================
@@ -414,6 +431,15 @@ def collect_config_files(claude_home: Optional[Path] = None) -> Dict[str, List[F
 # Context Detection
 # =============================================================================
 
+def classify_maturity(total_tokens: int) -> str:
+    """Classify config maturity based on total token count."""
+    if total_tokens < 500:
+        return "sparse"
+    elif total_tokens < 3000:
+        return "moderate"
+    else:
+        return "rich"
+
 def detect_context(
     files: Dict[str, List[FileMetrics]],
     claude_home: Optional[Path] = None,
@@ -433,12 +459,7 @@ def detect_context(
         for f in file_list:
             total_tokens += f.estimated_tokens
 
-    if total_tokens < 500:
-        config_maturity = "sparse"
-    elif total_tokens < 3000:
-        config_maturity = "moderate"
-    else:
-        config_maturity = "rich"
+    config_maturity = classify_maturity(total_tokens)
 
     setup_type = "multi_project" if project_count >= 2 else "single_project"
 
