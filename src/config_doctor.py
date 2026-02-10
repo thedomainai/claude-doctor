@@ -47,6 +47,8 @@ class Style:
     BG_YELLOW = "\033[43m"
     BG_BLUE = "\033[44m"
 
+    _defaults: dict = {}
+
     @classmethod
     def disable(cls) -> None:
         for attr in dir(cls):
@@ -55,8 +57,23 @@ class Style:
         cls._enabled = False
 
     @classmethod
+    def reset(cls) -> None:
+        """Restore all style attributes to their original values."""
+        for attr, value in cls._defaults.items():
+            setattr(cls, attr, value)
+        cls._enabled = True
+
+    @classmethod
     def is_enabled(cls) -> bool:
         return cls._enabled
+
+
+# Store default Style values for reset()
+Style._defaults = {
+    attr: getattr(Style, attr)
+    for attr in dir(Style)
+    if attr.isupper() and not attr.startswith("_")
+}
 
 
 # =============================================================================
