@@ -1537,10 +1537,6 @@ def run_diagnosis(
                 check.name(), check.display_name(), [], 1.0, False
             ))
 
-    # Free content strings after checks are done (no longer needed)
-    for fm in iter_content_files(files):
-        fm.content = ""
-
     overall_score, overall_rating = calculate_overall(results)
     return results, files, ctx, overall_score, overall_rating
 
@@ -1563,6 +1559,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     else:
         print(format_report(results, files, ctx, overall_score,
                             overall_rating, args.context_window))
+
+    # Free content strings in CLI path (not needed after output)
+    for fm in iter_content_files(files):
+        fm.content = ""
 
 
 if __name__ == "__main__":
