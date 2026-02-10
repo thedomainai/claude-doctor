@@ -84,7 +84,7 @@ Checks like Redundancy, Conflicts, and Effectiveness are skipped for sparse conf
 
 ## Scoring
 
-Each dimension receives a score from 0 to 100. The overall score is a weighted average:
+Each dimension receives a score from 0 to 100, computed using multiplicative penalties (each finding reduces the score by a percentage rather than a fixed amount, so scores degrade gracefully instead of hitting zero). The overall score is a weighted average:
 
 | Dimension | Weight |
 |-----------|--------|

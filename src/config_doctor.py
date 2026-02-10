@@ -581,15 +581,14 @@ class Check(ABC):
         if not findings:
             return CheckResult(self.name(), self.display_name(), [], 1.0, True)
 
-        penalty = 0.0
+        score = 1.0
         for f in findings:
             if f.severity == "error":
-                penalty += PENALTY_ERROR
+                score *= (1.0 - PENALTY_ERROR)
             elif f.severity == "warning":
-                penalty += PENALTY_WARNING
+                score *= (1.0 - PENALTY_WARNING)
             elif f.severity == "info":
-                penalty += PENALTY_INFO
-        score = max(0.0, 1.0 - penalty)
+                score *= (1.0 - PENALTY_INFO)
         return CheckResult(self.name(), self.display_name(), findings, score, True)
 
 
@@ -609,8 +608,9 @@ class BudgetCheck(Check):
     def is_applicable(self, ctx: UserContext) -> bool:
         return True
 
-    def run(self, files: Dict[str, List[FileMetrics]], ctx: UserContext,
-            context_window: int) -> CheckResult:
+    def _check_total_budget(
+        self, ctx: UserContext, context_window: int,
+    ) -> List[Finding]:
         findings = []
         total = ctx.total_config_tokens
         ratio = total / context_window
@@ -633,7 +633,12 @@ class BudgetCheck(Check):
                 file_path="(total)",
                 suggestion="Config is growing. Consider simplifying",
             ))
+        return findings
 
+    def _check_per_file_budget(
+        self, files: Dict[str, List[FileMetrics]],
+    ) -> List[Finding]:
+        findings = []
         for f in iter_content_files(files):
             if f.estimated_tokens > BUDGET_FILE_TOKEN_LIMIT:
                 findings.append(Finding(
@@ -643,7 +648,12 @@ class BudgetCheck(Check):
                     file_path=f.path,
                     suggestion="Consider splitting or simplifying this file",
                 ))
+        return findings
 
+    def _check_memory_lines(
+        self, files: Dict[str, List[FileMetrics]],
+    ) -> List[Finding]:
+        findings = []
         for mem in files.get("memories", []):
             if mem.line_count > MEMORY_WARNING_LINES:
                 findings.append(Finding(
@@ -660,7 +670,14 @@ class BudgetCheck(Check):
                             % (mem.line_count, MEMORY_LINE_LIMIT),
                     file_path=mem.path,
                 ))
+        return findings
 
+    def run(self, files: Dict[str, List[FileMetrics]], ctx: UserContext,
+            context_window: int) -> CheckResult:
+        findings = []
+        findings.extend(self._check_total_budget(ctx, context_window))
+        findings.extend(self._check_per_file_budget(files))
+        findings.extend(self._check_memory_lines(files))
         return self._make_result(findings)
 
 
@@ -692,9 +709,8 @@ class RedundancyCheck(Check):
                 if not stripped.startswith(("- ", "* ")):
                     continue
                 normalized = stripped.lstrip("-* ").strip()
-                normalized = re.sub(r'[\s\u3000\u3001\u3002.,]+', '', normalized)
-                normalized = normalized.lower()
-                if len(normalized) < 5:
+                normalized = re.sub(r'\s+', ' ', normalized).lower()
+                if len(normalized) < 10:
                     continue
                 if normalized not in directives_by_norm:
                     directives_by_norm[normalized] = []
@@ -1520,6 +1536,10 @@ def run_diagnosis(
             results.append(CheckResult(
                 check.name(), check.display_name(), [], 1.0, False
             ))
+
+    # Free content strings after checks are done (no longer needed)
+    for fm in iter_content_files(files):
+        fm.content = ""
 
     overall_score, overall_rating = calculate_overall(results)
     return results, files, ctx, overall_score, overall_rating
