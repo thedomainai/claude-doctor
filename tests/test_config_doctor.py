@@ -330,6 +330,24 @@ class TestRedundancyCheck(TestCase):
         ctx = _make_context(config_maturity="sparse")
         self.assertFalse(cd.RedundancyCheck().is_applicable(ctx))
 
+    def test_similar_but_distinct_not_flagged(self):
+        """Similar directives that differ meaningfully should not be flagged."""
+        files = {
+            "global_claude_md": [_make_file(
+                content="- Use English for documentation\n",
+            )],
+            "rules": [_make_file(
+                path="/mock/rule.md", category="rule",
+                content="- Use English for commit messages\n",
+            )],
+            "memories": [],
+            "project_claude_mds": [],
+        }
+        ctx = _make_context()
+        result = cd.RedundancyCheck().run(files, ctx, CW)
+        self.assertEqual(result.score, 1.0)
+        self.assertEqual(len(result.findings), 0)
+
 
 class TestScopeFitnessCheck(TestCase):
     def test_not_applicable_when_sparse(self):
@@ -556,6 +574,44 @@ class TestScoring(TestCase):
             cd.CheckResult("redundancy", "Redundancy", [], 0.0, False),
         ]
         score, rating = cd.calculate_overall(results)
+        self.assertEqual(score, 1.0)
+
+
+class TestMultiplicativeScoring(TestCase):
+    """Verify that _make_result uses multiplicative penalty."""
+
+    def _score_with_findings(self, severities):
+        """Run _make_result via a BudgetCheck instance and return the score."""
+        findings = [
+            cd.Finding(severity=s, dimension="test", message="t", file_path="t")
+            for s in severities
+        ]
+        check = cd.BudgetCheck()
+        result = check._make_result(findings)
+        return result.score
+
+    def test_single_error(self):
+        score = self._score_with_findings(["error"])
+        self.assertAlmostEqual(score, 0.7, places=2)
+
+    def test_two_errors(self):
+        score = self._score_with_findings(["error", "error"])
+        # 1.0 * 0.7 * 0.7 = 0.49
+        self.assertAlmostEqual(score, 0.49, places=2)
+
+    def test_four_errors_not_zero(self):
+        score = self._score_with_findings(["error"] * 4)
+        # 0.7^4 = 0.2401 — multiplicative: never reaches 0.0
+        self.assertGreater(score, 0.0)
+        self.assertAlmostEqual(score, 0.24, places=2)
+
+    def test_many_errors_still_positive(self):
+        score = self._score_with_findings(["error"] * 8)
+        # 0.7^8 ≈ 0.058 — still distinguishable from 0
+        self.assertGreater(score, 0.0)
+
+    def test_no_findings_perfect(self):
+        score = self._score_with_findings([])
         self.assertEqual(score, 1.0)
 
 
