@@ -111,6 +111,8 @@ class UserContext:
     rule_count: int
     skill_count: int
     project_dirs: List[str]  # discovered project directories
+    audit_sessions: Optional[List['SessionMetrics']] = None
+    audit_days: int = 7
 
 
 @dataclass
@@ -549,6 +551,172 @@ MATURITY_MODERATE_LIMIT = 3000
 PENALTY_ERROR = 0.3
 PENALTY_WARNING = 0.15
 PENALTY_INFO = 0.05
+
+
+# =============================================================================
+# Session Log Analysis
+# =============================================================================
+
+@dataclass
+class SessionMetrics:
+    """Metrics extracted from a single session log."""
+    session_file: str
+    message_count: int
+    tool_calls: Dict[str, int]
+    model_usage: Dict[str, int]
+    error_count: int
+    has_wrapup: bool
+    has_completion_indicator: bool
+    input_output_ratio: float
+    duration_seconds: Optional[int]
+
+
+def collect_session_logs(claude_home: Path, days: int = 7) -> List[SessionMetrics]:
+    """Collect session metrics from JSONL files in ~/.claude/projects/.
+
+    Args:
+        claude_home: Path to .claude directory
+        days: Only process sessions modified within this many days
+
+    Returns:
+        List of SessionMetrics for sessions matching the time filter
+    """
+    projects_dir = claude_home / "projects"
+    if not projects_dir.exists():
+        return []
+
+    now = datetime.now(tz=timezone.utc)
+    cutoff_ts = now.timestamp() - (days * 86400)
+
+    sessions = []
+
+    for project_dir in projects_dir.iterdir():
+        if not project_dir.is_dir() or project_dir.name.startswith("."):
+            continue
+
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            try:
+                stat = jsonl_file.stat()
+                if stat.st_mtime < cutoff_ts:
+                    continue
+
+                metrics = _parse_session_file(jsonl_file)
+                if metrics:
+                    sessions.append(metrics)
+            except (OSError, PermissionError):
+                continue
+
+    return sessions
+
+
+def _parse_session_file(file_path: Path) -> Optional[SessionMetrics]:
+    """Parse a single session JSONL file and extract metrics.
+
+    Streams the file line-by-line to avoid loading large files into memory.
+    """
+    message_count = 0
+    tool_calls: Dict[str, int] = {}
+    model_usage: Dict[str, int] = {}
+    error_count = 0
+    has_wrapup = False
+    has_completion_indicator = False
+    input_tokens = 0
+    output_tokens = 0
+    start_time = None
+    end_time = None
+
+    try:
+        with file_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type", "")
+
+                # Track message count
+                if event_type == "message":
+                    message_count += 1
+
+                    # Track model usage
+                    model = event.get("model", "unknown")
+                    model_usage[model] = model_usage.get(model, 0) + 1
+
+                    # Track timestamps
+                    if start_time is None and "timestamp" in event:
+                        start_time = event["timestamp"]
+                    if "timestamp" in event:
+                        end_time = event["timestamp"]
+
+                    # Track token usage
+                    usage = event.get("usage", {})
+                    input_tokens += usage.get("input_tokens", 0)
+                    output_tokens += usage.get("output_tokens", 0)
+
+                    # Check for completion indicators in assistant messages
+                    content = event.get("content", "")
+                    if isinstance(content, str):
+                        content_lower = content.lower()
+                        if any(kw in content_lower for kw in [
+                            "deployed", "committed", "test passed", "tests pass",
+                            "successfully deployed", "push complete", "published"
+                        ]):
+                            has_completion_indicator = True
+
+                # Track tool calls
+                elif event_type == "tool_use":
+                    tool_name = event.get("name", "unknown")
+                    tool_calls[tool_name] = tool_calls.get(tool_name, 0) + 1
+
+                    # Check for Skill invocations
+                    if tool_name == "Skill":
+                        skill_name = event.get("input", {}).get("skill", "")
+                        if skill_name == "wrapup":
+                            has_wrapup = True
+
+                # Track errors
+                elif event_type == "tool_result":
+                    if event.get("is_error", False):
+                        error_count += 1
+
+        if message_count == 0:
+            return None
+
+        # Calculate input/output ratio
+        if output_tokens > 0:
+            input_output_ratio = input_tokens / output_tokens
+        else:
+            input_output_ratio = 0.0
+
+        # Calculate duration
+        duration_seconds = None
+        if start_time and end_time:
+            try:
+                start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+                duration_seconds = int((end_dt - start_dt).total_seconds())
+            except (ValueError, AttributeError):
+                pass
+
+        return SessionMetrics(
+            session_file=str(file_path),
+            message_count=message_count,
+            tool_calls=tool_calls,
+            model_usage=model_usage,
+            error_count=error_count,
+            has_wrapup=has_wrapup,
+            has_completion_indicator=has_completion_indicator,
+            input_output_ratio=input_output_ratio,
+            duration_seconds=duration_seconds,
+        )
+
+    except (OSError, PermissionError):
+        return None
 
 
 class Check(ABC):
@@ -1138,11 +1306,355 @@ class EffectivenessProxyCheck(Check):
         return self._make_result(findings)
 
 
+class SessionHistoryCheck(Check):
+    """Detect wrapup omissions and distillation candidates from session history."""
+
+    def name(self) -> str:
+        return "session_history"
+
+    def display_name(self) -> str:
+        return "Session History"
+
+    def is_applicable(self, ctx: UserContext) -> bool:
+        return ctx.audit_sessions is not None
+
+    def run(
+        self,
+        files: Dict[str, List[FileMetrics]],
+        ctx: UserContext,
+        context_window: int,
+    ) -> CheckResult:
+        if ctx.audit_sessions is None:
+            return self._make_result([], applicable=False)
+
+        findings = []
+        sessions = ctx.audit_sessions
+
+        wrapup_count = 0
+        medium_no_wrapup = 0
+
+        for session in sessions:
+            # Long sessions without wrapup
+            if session.message_count >= 50 and not session.has_wrapup:
+                findings.append(Finding(
+                    severity="warning",
+                    dimension="session_history",
+                    message="Long session without wrapup (%d messages)" % session.message_count,
+                    file_path=session.session_file,
+                    suggestion="Run /wrapup to distill learnings from this session",
+                ))
+
+            # Track medium sessions
+            if 20 <= session.message_count < 50:
+                if not session.has_wrapup:
+                    medium_no_wrapup += 1
+
+            # Track wrapup rate
+            if session.has_wrapup:
+                wrapup_count += 1
+
+        # Medium sessions without wrapup
+        if medium_no_wrapup >= 3:
+            findings.append(Finding(
+                severity="info",
+                dimension="session_history",
+                message="%d medium sessions without wrapup" % medium_no_wrapup,
+                file_path="(sessions)",
+                suggestion="Consider running /wrapup on longer sessions",
+            ))
+
+        # Overall wrapup rate
+        if len(sessions) > 0:
+            wrapup_rate = wrapup_count / len(sessions) * 100
+            if wrapup_rate < 20:
+                findings.append(Finding(
+                    severity="warning",
+                    dimension="session_history",
+                    message="Low wrapup rate (%.0f%%)" % wrapup_rate,
+                    file_path="(sessions)",
+                    suggestion="Use /wrapup regularly to capture insights",
+                ))
+
+        return self._make_result(findings)
+
+
+class ConfigBloatCheck(Check):
+    """Detect unused configuration and bloat."""
+
+    def name(self) -> str:
+        return "config_bloat"
+
+    def display_name(self) -> str:
+        return "Config Bloat"
+
+    def is_applicable(self, ctx: UserContext) -> bool:
+        return ctx.audit_sessions is not None
+
+    def run(
+        self,
+        files: Dict[str, List[FileMetrics]],
+        ctx: UserContext,
+        context_window: int,
+    ) -> CheckResult:
+        findings = []
+
+        # Collect 30-day session history for this check
+        claude_home = Path.home() / ".claude"
+        sessions_30d = collect_session_logs(claude_home, days=30)
+
+        # Check for unused skills (exclude wrapup and claude-doctor)
+        skill_usage: Dict[str, int] = {}
+        for session in sessions_30d:
+            for tool_name, count in session.tool_calls.items():
+                if tool_name == "Skill":
+                    # Would need to track skill name, but JSONL doesn't store it
+                    # in tool_calls. Skip for now.
+                    pass
+
+        # For simplicity, check if skill name appears in any session content
+        # (This is approximate - a full implementation would parse Skill tool inputs)
+        for skill_fm in files.get("skills", []):
+            skill_name = Path(skill_fm.path).parent.name
+            if skill_name in ["wrapup", "claude-doctor"]:
+                continue
+
+            # Check if skill name appears in session files
+            found = False
+            for session in sessions_30d:
+                try:
+                    with open(session.session_file, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                        if skill_name in content:
+                            found = True
+                            break
+                except (OSError, PermissionError):
+                    continue
+
+            if not found and skill_fm.exists:
+                findings.append(Finding(
+                    severity="info",
+                    dimension="config_bloat",
+                    message="Skill '%s' not used in last 30 days" % skill_name,
+                    file_path=skill_fm.path,
+                    suggestion="Consider removing unused skills",
+                ))
+
+        # Check for rules not referenced in sessions
+        for rule_fm in files.get("rules", []):
+            if not rule_fm.exists:
+                continue
+
+            rule_name = Path(rule_fm.path).stem
+
+            # Check if any keyword from the rule appears in sessions
+            keywords = []
+            for line in rule_fm.content.splitlines():
+                words = re.findall(r'\b\w{5,}\b', line)
+                keywords.extend(words[:3])  # Take first 3 significant words per line
+
+            found = False
+            for session in sessions_30d:
+                try:
+                    with open(session.session_file, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                        if any(kw in content for kw in keywords[:10]):  # Check top 10 keywords
+                            found = True
+                            break
+                except (OSError, PermissionError):
+                    continue
+
+            if not found and len(keywords) > 0:
+                findings.append(Finding(
+                    severity="info",
+                    dimension="config_bloat",
+                    message="Rule '%s' may not be applied" % rule_name,
+                    file_path=rule_fm.path,
+                    suggestion="Verify if rule is still relevant",
+                ))
+
+        # Check total config size
+        if ctx.total_config_tokens > 5000:
+            findings.append(Finding(
+                severity="info",
+                dimension="config_bloat",
+                message="Large config size (%d tokens)" % ctx.total_config_tokens,
+                file_path="(total)",
+                suggestion="Consider consolidating or removing unused content",
+            ))
+
+        return self._make_result(findings)
+
+
+class ToolUsageCheck(Check):
+    """Analyze tool and model usage patterns."""
+
+    def name(self) -> str:
+        return "tool_usage"
+
+    def display_name(self) -> str:
+        return "Tool Usage"
+
+    def is_applicable(self, ctx: UserContext) -> bool:
+        return ctx.audit_sessions is not None
+
+    def run(
+        self,
+        files: Dict[str, List[FileMetrics]],
+        ctx: UserContext,
+        context_window: int,
+    ) -> CheckResult:
+        if ctx.audit_sessions is None:
+            return self._make_result([], applicable=False)
+
+        findings = []
+        sessions = ctx.audit_sessions
+
+        # Aggregate tool calls
+        total_tool_calls = 0
+        bash_calls = 0
+        task_calls = 0
+        task_without_model = 0
+
+        for session in sessions:
+            for tool_name, count in session.tool_calls.items():
+                total_tool_calls += count
+                if tool_name == "Bash":
+                    bash_calls += count
+                elif tool_name == "Task":
+                    task_calls += count
+                    # Check if model was specified (would need to parse input)
+                    # For now, we approximate by checking session content
+
+        # Bash usage ratio
+        if total_tool_calls > 0:
+            bash_ratio = bash_calls / total_tool_calls * 100
+            if bash_ratio > 50:
+                findings.append(Finding(
+                    severity="info",
+                    dimension="tool_usage",
+                    message="High Bash usage (%.0f%%)" % bash_ratio,
+                    file_path="(sessions)",
+                    suggestion="Consider using specialized tools (Read, Edit, Grep) "
+                               "instead of Bash",
+                ))
+
+        # Opus usage
+        opus_sessions = 0
+        for session in sessions:
+            for model, count in session.model_usage.items():
+                if "opus" in model.lower():
+                    opus_sessions += 1
+                    break
+
+        if len(sessions) > 0:
+            opus_ratio = opus_sessions / len(sessions) * 100
+            if opus_ratio > 80:
+                findings.append(Finding(
+                    severity="info",
+                    dimension="tool_usage",
+                    message="High Opus usage (%d/%d sessions)" % (opus_sessions, len(sessions)),
+                    file_path="(sessions)",
+                    suggestion="Consider using Sonnet or Haiku for simpler tasks",
+                ))
+
+        # Task subagent model specification
+        # This would require parsing Task tool inputs from JSONL
+        # Skipping for now as it requires more complex parsing
+
+        return self._make_result(findings)
+
+
+class WorkQualityCheck(Check):
+    """Analyze work quality indicators from recent sessions."""
+
+    def name(self) -> str:
+        return "work_quality"
+
+    def display_name(self) -> str:
+        return "Work Quality"
+
+    def is_applicable(self, ctx: UserContext) -> bool:
+        return ctx.audit_sessions is not None
+
+    def run(
+        self,
+        files: Dict[str, List[FileMetrics]],
+        ctx: UserContext,
+        context_window: int,
+    ) -> CheckResult:
+        if ctx.audit_sessions is None:
+            return self._make_result([], applicable=False)
+
+        findings = []
+
+        # Get today's sessions only
+        now = datetime.now(tz=timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_sessions = []
+
+        for session in ctx.audit_sessions or []:
+            try:
+                session_path = Path(session.session_file)
+                stat = session_path.stat()
+                session_mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                if session_mtime >= today_start:
+                    today_sessions.append(session)
+            except (OSError, AttributeError):
+                continue
+
+        if not today_sessions:
+            return self._make_result(findings)
+
+        # Input/output ratio
+        high_ratio_count = 0
+        for session in today_sessions:
+            if session.input_output_ratio > 10:
+                high_ratio_count += 1
+
+        if high_ratio_count > 0:
+            findings.append(Finding(
+                severity="info",
+                dimension="work_quality",
+                message="%d sessions with high input/output ratio" % high_ratio_count,
+                file_path="(sessions)",
+                suggestion="May indicate excessive context without enough output. "
+                           "Consider breaking into smaller sessions",
+            ))
+
+        # Error rate
+        total_errors = sum(s.error_count for s in today_sessions)
+        avg_errors = total_errors / len(today_sessions) if today_sessions else 0
+        if avg_errors > 5:
+            findings.append(Finding(
+                severity="warning",
+                dimension="work_quality",
+                message="High error rate (%.1f errors/session)" % avg_errors,
+                file_path="(sessions)",
+                suggestion="Review tool usage patterns and error messages",
+            ))
+
+        # Completion indicators
+        long_sessions = [s for s in today_sessions if s.message_count >= 20]
+        if long_sessions:
+            no_completion = sum(1 for s in long_sessions if not s.has_completion_indicator)
+            if no_completion / len(long_sessions) > 0.5:
+                findings.append(Finding(
+                    severity="info",
+                    dimension="work_quality",
+                    message="%d sessions without completion indicators" % no_completion,
+                    file_path="(sessions)",
+                    suggestion="Sessions may be incomplete. Consider finishing tasks "
+                               "or using /wrapup",
+                ))
+
+        return self._make_result(findings)
+
+
 # =============================================================================
 # Check Registry & Scoring
 # =============================================================================
 
-ALL_CHECKS: List[Check] = [
+STATIC_CHECKS: List[Check] = [
     BudgetCheck(),
     RedundancyCheck(),
     ScopeFitnessCheck(),
@@ -1152,6 +1664,15 @@ ALL_CHECKS: List[Check] = [
     EffectivenessProxyCheck(),
 ]
 
+AUDIT_CHECKS: List[Check] = [
+    SessionHistoryCheck(),
+    ConfigBloatCheck(),
+    ToolUsageCheck(),
+    WorkQualityCheck(),
+]
+
+ALL_CHECKS: List[Check] = STATIC_CHECKS + AUDIT_CHECKS
+
 WEIGHTS: Dict[str, float] = {
     "budget": 1.0,
     "redundancy": 0.5,
@@ -1160,6 +1681,10 @@ WEIGHTS: Dict[str, float] = {
     "conflicts": 1.5,
     "coverage": 1.0,
     "effectiveness_proxy": 0.5,
+    "session_history": 1.0,
+    "config_bloat": 0.5,
+    "tool_usage": 0.5,
+    "work_quality": 1.0,
 }
 
 
@@ -1511,12 +2036,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--claude-home", type=str, default=None,
         help="Path to .claude directory (default: ~/.claude)",
     )
+    parser.add_argument(
+        "--audit", action="store_true",
+        help="Enable audit checks (session history analysis)",
+    )
+    parser.add_argument(
+        "--audit-days", type=int, default=7,
+        help="Number of days of session history to analyze (default: 7)",
+    )
+    parser.add_argument(
+        "--quick", action="store_true",
+        help="Quick mode: skip audit checks",
+    )
     return parser.parse_args(argv)
 
 
 def run_diagnosis(
     claude_home: Optional[Path] = None,
     context_window: int = DEFAULT_CONTEXT_WINDOW,
+    enable_audit: bool = False,
+    audit_days: int = 7,
 ) -> Tuple[
     List[CheckResult],
     Dict[str, List[FileMetrics]],
@@ -1525,11 +2064,22 @@ def run_diagnosis(
     str,
 ]:
     """Run the full diagnosis and return results (API for tests and integrations)."""
+    if claude_home is None:
+        claude_home = Path.home() / ".claude"
+
     files = collect_config_files(claude_home)
     ctx = detect_context(files, claude_home)
 
+    # Load session data if audit is enabled
+    if enable_audit:
+        ctx.audit_sessions = collect_session_logs(claude_home, days=audit_days)
+        ctx.audit_days = audit_days
+        checks_to_run = STATIC_CHECKS + AUDIT_CHECKS
+    else:
+        checks_to_run = STATIC_CHECKS
+
     results = []
-    for check in ALL_CHECKS:
+    for check in checks_to_run:
         if check.is_applicable(ctx):
             results.append(check.run(files, ctx, context_window))
         else:
@@ -1549,8 +2099,11 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     claude_home = Path(args.claude_home) if args.claude_home else None
 
+    # --quick overrides --audit
+    enable_audit = args.audit and not args.quick
+
     results, files, ctx, overall_score, overall_rating = run_diagnosis(
-        claude_home, args.context_window
+        claude_home, args.context_window, enable_audit, args.audit_days
     )
 
     if args.json:

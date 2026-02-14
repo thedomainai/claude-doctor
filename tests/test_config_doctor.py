@@ -1066,5 +1066,295 @@ class TestNegationBoundaries(TestCase):
         self.assertEqual(neg_findings[0].severity, "warning")
 
 
+# =============================================================================
+# Session Metrics Tests
+# =============================================================================
+
+class TestSessionMetrics(TestCase):
+    def _write_session_jsonl(self, path: Path, events: List[Dict]) -> None:
+        """Helper to write a session JSONL file."""
+        with path.open("w", encoding="utf-8") as f:
+            for event in events:
+                f.write(json.dumps(event) + "\n")
+
+    def test_parse_empty_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.jsonl"
+            session_file.write_text("")
+            metrics = cd._parse_session_file(session_file)
+            self.assertIsNone(metrics)
+
+    def test_parse_basic_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.jsonl"
+            events = [
+                {"type": "message", "model": "claude-opus-4", "timestamp": "2026-02-12T10:00:00Z",
+                 "usage": {"input_tokens": 100, "output_tokens": 50}, "content": "Hello"},
+                {"type": "tool_use", "name": "Bash"},
+                {"type": "message", "model": "claude-opus-4", "timestamp": "2026-02-12T10:01:00Z",
+                 "usage": {"input_tokens": 200, "output_tokens": 100}, "content": "Done"},
+            ]
+            self._write_session_jsonl(session_file, events)
+            metrics = cd._parse_session_file(session_file)
+            self.assertIsNotNone(metrics)
+            self.assertEqual(metrics.message_count, 2)
+            self.assertEqual(metrics.tool_calls.get("Bash", 0), 1)
+            self.assertEqual(metrics.model_usage.get("claude-opus-4", 0), 2)
+            self.assertAlmostEqual(metrics.input_output_ratio, 2.0, places=1)
+
+    def test_wrapup_detection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.jsonl"
+            events = [
+                {"type": "message", "model": "claude-opus-4", "usage": {"input_tokens": 100, "output_tokens": 50}},
+                {"type": "tool_use", "name": "Skill", "input": {"skill": "wrapup"}},
+            ]
+            self._write_session_jsonl(session_file, events)
+            metrics = cd._parse_session_file(session_file)
+            self.assertTrue(metrics.has_wrapup)
+
+    def test_completion_indicator_detection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.jsonl"
+            events = [
+                {"type": "message", "model": "claude-opus-4", "usage": {"input_tokens": 100, "output_tokens": 50},
+                 "content": "Successfully deployed to production"},
+            ]
+            self._write_session_jsonl(session_file, events)
+            metrics = cd._parse_session_file(session_file)
+            self.assertTrue(metrics.has_completion_indicator)
+
+    def test_error_count(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.jsonl"
+            events = [
+                {"type": "message", "model": "claude-opus-4", "usage": {"input_tokens": 100, "output_tokens": 50}},
+                {"type": "tool_result", "is_error": True},
+                {"type": "tool_result", "is_error": False},
+                {"type": "tool_result", "is_error": True},
+            ]
+            self._write_session_jsonl(session_file, events)
+            metrics = cd._parse_session_file(session_file)
+            self.assertEqual(metrics.error_count, 2)
+
+
+class TestCollectSessionLogs(TestCase):
+    def test_no_projects_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claude_home = Path(tmpdir) / ".claude"
+            claude_home.mkdir()
+            sessions = cd.collect_session_logs(claude_home, days=7)
+            self.assertEqual(len(sessions), 0)
+
+    def test_collect_recent_sessions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claude_home = Path(tmpdir) / ".claude"
+            projects_dir = claude_home / "projects" / "test-project"
+            projects_dir.mkdir(parents=True)
+
+            # Create a recent session
+            session_file = projects_dir / "session.jsonl"
+            events = [
+                {"type": "message", "model": "claude-opus-4", "usage": {"input_tokens": 100, "output_tokens": 50}},
+            ]
+            with session_file.open("w") as f:
+                for event in events:
+                    f.write(json.dumps(event) + "\n")
+
+            sessions = cd.collect_session_logs(claude_home, days=7)
+            self.assertEqual(len(sessions), 1)
+
+
+# =============================================================================
+# Audit Check Tests
+# =============================================================================
+
+class TestSessionHistoryCheck(TestCase):
+    def _make_session(self, message_count=10, has_wrapup=False):
+        return cd.SessionMetrics(
+            session_file="/mock/session.jsonl",
+            message_count=message_count,
+            tool_calls={},
+            model_usage={},
+            error_count=0,
+            has_wrapup=has_wrapup,
+            has_completion_indicator=False,
+            input_output_ratio=1.0,
+            duration_seconds=None,
+        )
+
+    def test_not_applicable_without_audit(self):
+        ctx = _make_context()
+        check = cd.SessionHistoryCheck()
+        self.assertFalse(check.is_applicable(ctx))
+
+    def test_long_session_without_wrapup(self):
+        ctx = _make_context(audit_sessions=[self._make_session(message_count=60, has_wrapup=False)])
+        result = cd.SessionHistoryCheck().run({}, ctx, CW)
+        self.assertTrue(any("Long session" in f.message for f in result.findings))
+
+    def test_medium_sessions_without_wrapup(self):
+        sessions = [self._make_session(message_count=25, has_wrapup=False) for _ in range(3)]
+        ctx = _make_context(audit_sessions=sessions)
+        result = cd.SessionHistoryCheck().run({}, ctx, CW)
+        self.assertTrue(any("medium sessions" in f.message for f in result.findings))
+
+    def test_low_wrapup_rate(self):
+        sessions = [self._make_session(message_count=10, has_wrapup=False) for _ in range(10)]
+        ctx = _make_context(audit_sessions=sessions)
+        result = cd.SessionHistoryCheck().run({}, ctx, CW)
+        self.assertTrue(any("Low wrapup rate" in f.message for f in result.findings))
+
+
+class TestConfigBloatCheck(TestCase):
+    def test_not_applicable_without_audit(self):
+        ctx = _make_context()
+        check = cd.ConfigBloatCheck()
+        self.assertFalse(check.is_applicable(ctx))
+
+    def test_large_config_size(self):
+        ctx = _make_context(total_config_tokens=6000, audit_sessions=[])
+        result = cd.ConfigBloatCheck().run({}, ctx, CW)
+        self.assertTrue(any("Large config size" in f.message for f in result.findings))
+
+
+class TestToolUsageCheck(TestCase):
+    def test_not_applicable_without_audit(self):
+        ctx = _make_context()
+        check = cd.ToolUsageCheck()
+        self.assertFalse(check.is_applicable(ctx))
+
+    def test_high_bash_usage(self):
+        session = cd.SessionMetrics(
+            session_file="/mock/session.jsonl",
+            message_count=10,
+            tool_calls={"Bash": 60, "Read": 20, "Edit": 20},
+            model_usage={},
+            error_count=0,
+            has_wrapup=False,
+            has_completion_indicator=False,
+            input_output_ratio=1.0,
+            duration_seconds=None,
+        )
+        ctx = _make_context(audit_sessions=[session])
+        result = cd.ToolUsageCheck().run({}, ctx, CW)
+        self.assertTrue(any("High Bash usage" in f.message for f in result.findings))
+
+    def test_high_opus_usage(self):
+        sessions = []
+        for i in range(10):
+            session = cd.SessionMetrics(
+                session_file=f"/mock/session{i}.jsonl",
+                message_count=10,
+                tool_calls={},
+                model_usage={"claude-opus-4": 5},
+                error_count=0,
+                has_wrapup=False,
+                has_completion_indicator=False,
+                input_output_ratio=1.0,
+                duration_seconds=None,
+            )
+            sessions.append(session)
+        ctx = _make_context(audit_sessions=sessions)
+        result = cd.ToolUsageCheck().run({}, ctx, CW)
+        self.assertTrue(any("High Opus usage" in f.message for f in result.findings))
+
+
+class TestWorkQualityCheck(TestCase):
+    def test_not_applicable_without_audit(self):
+        ctx = _make_context()
+        check = cd.WorkQualityCheck()
+        self.assertFalse(check.is_applicable(ctx))
+
+    def test_high_input_output_ratio(self):
+        # Create a temporary session file with today's timestamp
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.jsonl"
+            session_file.write_text(json.dumps({"type": "message", "model": "test", "usage": {}}) + "\n")
+
+            session = cd.SessionMetrics(
+                session_file=str(session_file),
+                message_count=10,
+                tool_calls={},
+                model_usage={},
+                error_count=0,
+                has_wrapup=False,
+                has_completion_indicator=False,
+                input_output_ratio=15.0,
+                duration_seconds=None,
+            )
+            ctx = _make_context(audit_sessions=[session])
+            result = cd.WorkQualityCheck().run({}, ctx, CW)
+            self.assertTrue(any("high input/output ratio" in f.message for f in result.findings))
+
+    def test_high_error_rate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.jsonl"
+            session_file.write_text(json.dumps({"type": "message", "model": "test", "usage": {}}) + "\n")
+
+            session = cd.SessionMetrics(
+                session_file=str(session_file),
+                message_count=10,
+                tool_calls={},
+                model_usage={},
+                error_count=10,
+                has_wrapup=False,
+                has_completion_indicator=False,
+                input_output_ratio=1.0,
+                duration_seconds=None,
+            )
+            ctx = _make_context(audit_sessions=[session])
+            result = cd.WorkQualityCheck().run({}, ctx, CW)
+            self.assertTrue(any("High error rate" in f.message for f in result.findings))
+
+
+# =============================================================================
+# CLI Integration Tests
+# =============================================================================
+
+class TestAuditCLI(TestCase):
+    def test_audit_flag_enables_checks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claude_home = Path(tmpdir) / ".claude"
+            claude_home.mkdir()
+            (claude_home / "CLAUDE.md").write_text("# Test\n")
+            projects_dir = claude_home / "projects" / "test"
+            projects_dir.mkdir(parents=True)
+
+            import io
+            from contextlib import redirect_stdout
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cd.main(["--audit", "--json", "--claude-home", str(claude_home)])
+
+            output = buf.getvalue()
+            parsed = json.loads(output)
+            check_names = [c["check_name"] for c in parsed["checks"]]
+            self.assertIn("session_history", check_names)
+            self.assertIn("config_bloat", check_names)
+            self.assertIn("tool_usage", check_names)
+            self.assertIn("work_quality", check_names)
+
+    def test_quick_mode_skips_audit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claude_home = Path(tmpdir) / ".claude"
+            claude_home.mkdir()
+            (claude_home / "CLAUDE.md").write_text("# Test\n")
+
+            import io
+            from contextlib import redirect_stdout
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cd.main(["--quick", "--audit", "--json", "--claude-home", str(claude_home)])
+
+            output = buf.getvalue()
+            parsed = json.loads(output)
+            check_names = [c["check_name"] for c in parsed["checks"]]
+            self.assertNotIn("session_history", check_names)
+            self.assertNotIn("config_bloat", check_names)
+
+
 if __name__ == "__main__":
     main()
